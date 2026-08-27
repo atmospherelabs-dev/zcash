@@ -17,6 +17,7 @@ use tokio::{signal, time::sleep};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use ziggurat_core_crawler::summary::NetworkSummary;
+use crate::metrics::ExtendedSummary;
 use ziggurat_zcash::wait_until;
 
 use crate::{
@@ -146,7 +147,7 @@ async fn main() {
     let crawler = Crawler::new().await;
 
     let mut network_metrics = NetworkMetrics::default();
-    let summary_snapshot = Arc::new(Mutex::new(NetworkSummary::default()));
+    let summary_snapshot = Arc::new(Mutex::new(ExtendedSummary { summary: NetworkSummary::default(), node_info: Vec::new() }));
 
     // Initialize the RPC server if address is specified.
     let _rpc_handle = if let Some(addr) = args.rpc_addr {
@@ -287,8 +288,8 @@ async fn main() {
 
     // Print out summary of network metrics.
     let summary = summary.lock();
-    info!(parent: crawler_clone.node().span(), "{}", summary);
-    if let Err(e) = summary.log_to_file(LOG_PATH) {
+    info!(parent: crawler_clone.node().span(), "{}", summary.summary);
+    if let Err(e) = summary.summary.log_to_file(LOG_PATH) {
         error!(parent: crawler_clone.node().span(), "couldn't write summary to file: {}", e);
     }
 }

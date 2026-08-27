@@ -1,6 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr};
 
 use regex::Regex;
+use serde::Serialize;
 use spectre::{edge::Edge, graph::Graph};
 use ziggurat_core_crawler::summary::{NetworkSummary, NetworkType};
 
@@ -12,6 +13,25 @@ use crate::{
 const MIN_BLOCK_HEIGHT: i32 = 2_000_000;
 pub const ZCASH_P2P_DEFAULT_MAINNET_PORT: u16 = 8233;
 pub const ZCASH_P2P_DEFAULT_TESTNET_PORT: u16 = 18233;
+
+/// Per-node info exposed in the extended summary for the cruncher.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeInfo {
+    pub addr: String,
+    pub user_agent: Option<String>,
+    pub protocol_version: Option<u32>,
+    pub start_height: Option<i32>,
+    pub services: Option<u64>,
+    pub handshake_time_ms: Option<u64>,
+}
+
+/// Extended summary that includes per-node metadata alongside the standard NetworkSummary.
+#[derive(Clone, Serialize)]
+pub struct ExtendedSummary {
+    #[serde(flatten)]
+    pub summary: NetworkSummary,
+    pub node_info: Vec<NodeInfo>,
+}
 
 #[derive(Default)]
 pub struct NetworkMetrics {
@@ -31,25 +51,42 @@ impl NetworkMetrics {
         }
     }
 
-    /// Requests a summary of the network metrics.
-    pub fn request_summary(&mut self, crawler: &Crawler) -> NetworkSummary {
-        new_network_summary(crawler, &self.graph)
+    /// Requests a summary of the network metrics (extended with per-node info).
+    pub fn request_summary(&mut self, crawler: &Crawler) -> ExtendedSummary {
+        let summary = new_network_summary(crawler, &self.graph);
+        let nodes = crawler.known_network.nodes();
+
+        let node_info: Vec<NodeInfo> = summary.node_addrs.iter().map(|addr| {
+            let known = nodes.get(addr);
+            NodeInfo {
+                addr: addr.to_string(),
+                user_agent: known.and_then(|n| n.user_agent.as_ref().map(|v| v.0.clone())),
+                protocol_version: known.and_then(|n| n.protocol_version.map(|v| v.0)),
+                start_height: known.and_then(|n| n.start_height),
+                services: known.and_then(|n| n.services),
+                handshake_time_ms: known.and_then(|n| n.handshake_time.map(|d| d.as_millis() as u64)),
+            }
+        }).collect();
+
+        ExtendedSummary { summary, node_info }
     }
 }
 
-// Updates the node's network type.
-//
-// The decision of whether a node belongs to the Zcash network is based on these factors:
-//  `start_height` - this MUST match
-// and one of the additional factors also must match as an extra confirmation:
-// `port`
-// `agent`
+// Recognize network types with fixes for current mainnet:
+// - MagicBean major version 6+ is zcashd (NOT Flux — Flux uses different identifiers now)
+// - Zakura nodes are explicitly recognized
+// - Zebra regex updated for multi-digit versions (e.g. Zebra:6.3.0)
 fn recognize_network_types(
     nodes: &HashMap<SocketAddr, KnownNode>,
     good_nodes: &Vec<SocketAddr>,
 ) -> Vec<NetworkType> {
     let num_good_nodes = good_nodes.len();
     let mut node_network_types = Vec::with_capacity(num_good_nodes);
+
+    let zcash_regex = Regex::new(r"^/MagicBean:(\d+)\.(\d+)\.(\d+)/$").unwrap();
+    let zebra_regex = Regex::new(r"^/Zebra:(\d+)\.(\d+)\.(\d+)").unwrap();
+    let zakura_regex = Regex::new(r"^/Zakura:(\d+)\.(\d+)\.(\d+)").unwrap();
+
     for node in good_nodes {
         let mut agent_matches = false;
 
@@ -61,39 +98,30 @@ fn recognize_network_types(
         } else {
             "".to_string()
         };
-        let zcash_regex = Regex::new(r"^/MagicBean:(\d)\.(\d)\.(\d)/$").unwrap();
-        let zebra_regex = Regex::new(r"^/Zebra:(\d)\.(\d)\.(\d)").unwrap();
 
-        // Look for zcash agent like "/MagicBean:5.4.2/"
-        let cap_zc = zcash_regex.captures(agent.as_str());
-        if let Some(cap) = cap_zc {
-            let major = cap.get(1).unwrap().as_str().parse::<u32>().unwrap();
-            if major < 6 {
-                // Accept all zcash versions < 6 (6 is Flux)
-                agent_matches = true;
-            } else if major == 6 {
-                // Block all zcash versions 6 (Flux) even if they are on the right port
-                node_network_types.push(NetworkType::Unknown);
-                continue;
-            }
-        }
-
-        // Look for zebra agent like "/Zebra:1.0.0-rc.4/"
-        let cap_ze = zebra_regex.captures(agent.as_str());
-        if cap_ze.is_some() {
-            // Accept all zebra versions
+        // Zakura (Zcash implementation by Shielded Labs)
+        if zakura_regex.is_match(&agent) {
             agent_matches = true;
         }
 
-        // Check if the height is alright - this is a mandatory check for any zcash node implementation.
+        // Zebra (Zcash Foundation Rust implementation)
+        if zebra_regex.is_match(&agent) {
+            agent_matches = true;
+        }
+
+        // zcashd / MagicBean — all versions are valid Zcash nodes
+        // (Flux no longer uses this identifier pattern on mainnet)
+        if zcash_regex.is_match(&agent) {
+            agent_matches = true;
+        }
+
+        // Check block height — mandatory for any Zcash node
         let height = nodes[node].start_height.unwrap_or(0);
         if height < MIN_BLOCK_HEIGHT {
             node_network_types.push(NetworkType::Unknown);
             continue;
         }
 
-        // When a block height is correct, we still need one additional confirmation:
-        // In rare cases, the agent or the port won't use a commonly used value.
         if port_matches || agent_matches {
             node_network_types.push(NetworkType::Zcash);
         } else {
