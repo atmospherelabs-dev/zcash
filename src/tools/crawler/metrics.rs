@@ -53,20 +53,25 @@ impl NetworkMetrics {
 
     /// Requests a summary of the network metrics (extended with per-node info).
     pub fn request_summary(&mut self, crawler: &Crawler) -> ExtendedSummary {
-        let summary = new_network_summary(crawler, &self.graph);
         let nodes = crawler.known_network.nodes();
+        let summary = new_network_summary(crawler, &self.graph, &nodes);
 
-        let node_info: Vec<NodeInfo> = summary.node_addrs.iter().map(|addr| {
-            let known = nodes.get(addr);
-            NodeInfo {
-                addr: addr.to_string(),
-                user_agent: known.and_then(|n| n.user_agent.as_ref().map(|v| v.0.clone())),
-                protocol_version: known.and_then(|n| n.protocol_version.map(|v| v.0)),
-                start_height: known.and_then(|n| n.start_height),
-                services: known.and_then(|n| n.services),
-                handshake_time_ms: known.and_then(|n| n.handshake_time.map(|d| d.as_millis() as u64)),
-            }
-        }).collect();
+        let node_info: Vec<NodeInfo> = summary
+            .node_addrs
+            .iter()
+            .map(|addr| {
+                let known = nodes.get(addr);
+                NodeInfo {
+                    addr: addr.to_string(),
+                    user_agent: known.and_then(|n| n.user_agent.as_ref().map(|v| v.0.clone())),
+                    protocol_version: known.and_then(|n| n.protocol_version.map(|v| v.0)),
+                    start_height: known.and_then(|n| n.start_height),
+                    services: known.and_then(|n| n.services),
+                    handshake_time_ms: known
+                        .and_then(|n| n.handshake_time.map(|d| d.as_millis() as u64)),
+                }
+            })
+            .collect();
 
         ExtendedSummary { summary, node_info }
     }
@@ -83,7 +88,7 @@ fn recognize_network_types(
     let num_good_nodes = good_nodes.len();
     let mut node_network_types = Vec::with_capacity(num_good_nodes);
 
-    let zcash_regex = Regex::new(r"^/MagicBean:(\d+)\.(\d+)\.(\d+)/$").unwrap();
+    let zcash_regex = Regex::new(r"^/MagicBean:(\d+)\.(\d+)\.(\d+)[^/]*/$").unwrap();
     let zebra_regex = Regex::new(r"^/Zebra:(\d+)\.(\d+)\.(\d+)").unwrap();
     let zakura_regex = Regex::new(r"^/Zakura:(\d+)\.(\d+)\.(\d+)").unwrap();
 
@@ -133,17 +138,22 @@ fn recognize_network_types(
 }
 
 /// Constructs a new NetworkSummary from given nodes.
-pub fn new_network_summary(crawler: &Crawler, graph: &Graph<SocketAddr>) -> NetworkSummary {
-    let nodes = crawler.known_network.nodes();
+///
+/// Accepts a pre-cloned `nodes` snapshot so callers that also need the map
+/// (e.g. `request_summary`) avoid cloning it a second time.
+pub fn new_network_summary(
+    crawler: &Crawler,
+    graph: &Graph<SocketAddr>,
+    nodes: &HashMap<SocketAddr, KnownNode>,
+) -> NetworkSummary {
     let connections = crawler.known_network.connections();
 
     let num_known_nodes = nodes.len();
     let num_known_connections = connections.len();
 
     let good_nodes = nodes
-        .clone()
-        .into_iter()
-        .filter_map(|(addr, node)| node.last_connected.map(|_| addr))
+        .iter()
+        .filter_map(|(addr, node)| node.last_connected.map(|_| *addr))
         .collect::<Vec<_>>();
 
     let num_good_nodes = good_nodes.len();
@@ -164,7 +174,7 @@ pub fn new_network_summary(crawler: &Crawler, graph: &Graph<SocketAddr>) -> Netw
         }
     }
 
-    let node_network_types = recognize_network_types(&nodes, &good_nodes);
+    let node_network_types = recognize_network_types(nodes, &good_nodes);
 
     let num_versions = protocol_versions.values().sum();
     let nodes_indices = graph.get_filtered_adjacency_indices(&good_nodes);

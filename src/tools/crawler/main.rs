@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::metrics::ExtendedSummary;
 use clap::Parser;
 use dns_lookup::lookup_host;
 use parking_lot::Mutex;
@@ -17,7 +18,6 @@ use tokio::{signal, time::sleep};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use ziggurat_core_crawler::summary::NetworkSummary;
-use crate::metrics::ExtendedSummary;
 use ziggurat_zcash::wait_until;
 
 use crate::{
@@ -147,7 +147,10 @@ async fn main() {
     let crawler = Crawler::new().await;
 
     let mut network_metrics = NetworkMetrics::default();
-    let summary_snapshot = Arc::new(Mutex::new(ExtendedSummary { summary: NetworkSummary::default(), node_info: Vec::new() }));
+    let summary_snapshot = Arc::new(Mutex::new(ExtendedSummary {
+        summary: NetworkSummary::default(),
+        node_info: Vec::new(),
+    }));
 
     // Initialize the RPC server if address is specified.
     let _rpc_handle = if let Some(addr) = args.rpc_addr {
