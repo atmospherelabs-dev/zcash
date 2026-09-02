@@ -150,6 +150,9 @@ async fn main() {
     let summary_snapshot = Arc::new(Mutex::new(ExtendedSummary {
         summary: NetworkSummary::default(),
         node_info: Vec::new(),
+        all_node_addrs: Vec::new(),
+        all_nodes_indices: Vec::new(),
+        all_node_reachable: Vec::new(),
     }));
 
     // Initialize the RPC server if address is specified.

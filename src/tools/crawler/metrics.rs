@@ -26,11 +26,23 @@ pub struct NodeInfo {
 }
 
 /// Extended summary that includes per-node metadata alongside the standard NetworkSummary.
+///
+/// The standard `summary` (node_addrs / nodes_indices) is filtered to *good*
+/// (reachable, handshake-completed) nodes only. The `all_*` fields below expose
+/// the FULL known-network graph — every address the crawler has heard about via
+/// gossip, including nodes it could not reach — so downstream consumers can render
+/// the reachable core plus the wider known-address space ("off"/unreachable nodes).
 #[derive(Clone, Serialize)]
 pub struct ExtendedSummary {
     #[serde(flatten)]
     pub summary: NetworkSummary,
     pub node_info: Vec<NodeInfo>,
+    /// All known node addresses (reachable + unreachable), stable order matching `all_nodes_indices`.
+    pub all_node_addrs: Vec<String>,
+    /// Adjacency list over `all_node_addrs` (indices refer to positions in that vec).
+    pub all_nodes_indices: Vec<Vec<usize>>,
+    /// Parallel to `all_node_addrs`: true if the node completed a handshake (reachable).
+    pub all_node_reachable: Vec<bool>,
 }
 
 #[derive(Default)]
@@ -73,7 +85,25 @@ impl NetworkMetrics {
             })
             .collect();
 
-        ExtendedSummary { summary, node_info }
+        // Full known-network graph: every address heard about, connected as observed
+        // in the gossip graph. `get_filtered_adjacency_indices` returns adjacency whose
+        // indices reference positions in the passed slice, so we build the addr vec once
+        // and reuse its ordering for addrs, indices, and reachability.
+        let all_addrs: Vec<SocketAddr> = nodes.keys().cloned().collect();
+        let all_nodes_indices = self.graph.get_filtered_adjacency_indices(&all_addrs);
+        let all_node_reachable: Vec<bool> = all_addrs
+            .iter()
+            .map(|a| nodes.get(a).and_then(|n| n.last_connected).is_some())
+            .collect();
+        let all_node_addrs: Vec<String> = all_addrs.iter().map(|a| a.to_string()).collect();
+
+        ExtendedSummary {
+            summary,
+            node_info,
+            all_node_addrs,
+            all_nodes_indices,
+            all_node_reachable,
+        }
     }
 }
 

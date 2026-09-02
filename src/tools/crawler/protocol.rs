@@ -1,4 +1,5 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Instant};
+use std::{io, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use tokio::time::timeout;
 
 use futures_util::SinkExt;
 use pea2pea::{
@@ -23,6 +24,9 @@ pub const MAX_CONCURRENT_CONNECTIONS: u16 = 1200;
 pub const MAIN_LOOP_INTERVAL_SECS: u64 = 20;
 pub const RECONNECT_INTERVAL_SECS: u64 = 5 * 60;
 pub const MAX_WAIT_FOR_ADDR_SECS: u64 = 3 * 60;
+/// TCP connect timeout. Without this, connects to dead/firewalled peers hang on
+/// SYN retries for the OS default (~120s), leaking one FD each until exhaustion.
+pub const CONNECT_TIMEOUT_SECS: u64 = 5;
 
 /// Represents the crawler together with network metrics it has collected.
 #[derive(Clone)]
@@ -61,7 +65,15 @@ impl Crawler {
 
         let timestamp = Instant::now();
 
-        let result = self.node.connect(addr).await;
+        let result = match timeout(
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            self.node.connect(addr),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out")),
+        };
 
         if let Some(ref mut known_node) = self.known_network.nodes.write().get_mut(&addr) {
             match result {
