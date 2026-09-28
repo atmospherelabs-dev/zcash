@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::RwLock;
@@ -10,6 +10,14 @@ use ziggurat_zcash::protocol::payload::{ProtocolVersion, VarStr};
 
 /// The elapsed time before a connection should be regarded as inactive.
 pub const LAST_SEEN_CUTOFF: u64 = 10 * 60;
+pub const VERIFIED_WINDOW_SECS: u64 = 60 * 60;
+
+pub fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub enum ConnectionState {
@@ -26,6 +34,11 @@ pub struct KnownNode {
     // The address is omitted, as it's a key in the owning HashMap.
     /// The last time the node was successfully connected to.
     pub last_connected: Option<Instant>,
+    pub last_attempt: Option<Instant>,
+    pub version_received: bool,
+    pub verack_received: bool,
+    pub last_verified: Option<Instant>,
+    pub last_verified_at_ms: Option<u64>,
     /// The time it took to complete a connection.
     pub handshake_time: Option<Duration>,
     /// The node's protocol version.
@@ -40,6 +53,21 @@ pub struct KnownNode {
     pub connection_failures: u8,
     /// The node's state.
     pub state: ConnectionState,
+}
+
+impl KnownNode {
+    pub fn recently_verified(&self) -> bool {
+        self.last_verified
+            .is_some_and(|t| t.elapsed().as_secs() < VERIFIED_WINDOW_SECS)
+    }
+
+    pub fn record_verification(&mut self) {
+        if self.version_received && self.verack_received {
+            self.handshake_time = self.last_attempt.map(|t| t.elapsed());
+            self.last_verified = Some(Instant::now());
+            self.last_verified_at_ms = Some(unix_ms());
+        }
+    }
 }
 
 /// The list of nodes and connections the crawler is aware of.

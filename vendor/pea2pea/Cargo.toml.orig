@@ -1,0 +1,49 @@
+[package]
+name = "pea2pea"
+version = "0.46.0"
+authors = ["ljedrz <ljedrz@gmail.com>"]
+edition = "2021"
+description = "A simple, low-level, and customizable implementation of a TCP P2P node."
+license = "CC0-1.0"
+repository = "https://github.com/ljedrz/pea2pea"
+documentation = "https://docs.rs/pea2pea"
+readme = "README.md"
+categories = ["network-programming", "asynchronous"]
+keywords = ["p2p", "peer-to-peer", "networking"]
+rust-version = "1.56"
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[lib]
+crate-type = ["lib"]
+
+[features]
+test = []
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+once_cell = { version = "1", features = ["parking_lot"] }
+parking_lot = "0.12"
+tokio = { version = "1.24", features = ["io-util", "net", "parking_lot", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tracing = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+bincode = "1"
+deadline = "0.2"
+libp2p = { version = "0.51", default-features = false, features = ["macros", "noise", "ping", "tcp", "tokio", "yamux"] }
+native-tls = "0.2"
+peak_alloc = "0.2"
+prost = "0.11"
+rand = { version = "0.8", default-features = false, features = ["getrandom", "small_rng"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+snow = "0.9"
+test-cert-gen = "0.9"
+tokio = { version = "1.24", features = ["macros", "rt-multi-thread"] }
+tokio-native-tls = "0.3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "parking_lot", "smallvec"] }
+unsigned-varint = { git = "https://github.com/ljedrz/unsigned-varint", branch = "update_tokio_util", features = ["codec", "futures"] }
+pea2pea = { path = ".", features = ["test"] } # a workaround to use the `test` feature in tests by default

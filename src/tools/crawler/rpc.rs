@@ -3,22 +3,23 @@ use std::{net::SocketAddr, sync::Arc};
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
 use parking_lot::Mutex;
 use tracing::debug;
-use ziggurat_core_crawler::summary::NetworkSummary;
 
-pub struct RpcContext(Arc<Mutex<NetworkSummary>>);
+use crate::metrics::ExtendedSummary;
+
+pub struct RpcContext(Arc<Mutex<ExtendedSummary>>);
 
 /// Allow JSON-RPC response size to be up to 200MB
 pub const MAX_RESPONSE_SIZE: u32 = 200_000_000;
 
 impl RpcContext {
     /// Creates a new RpcContext.
-    pub fn new(known_network: Arc<Mutex<NetworkSummary>>) -> RpcContext {
+    pub fn new(known_network: Arc<Mutex<ExtendedSummary>>) -> RpcContext {
         RpcContext(known_network)
     }
 }
 
 impl std::ops::Deref for RpcContext {
-    type Target = Mutex<NetworkSummary>;
+    type Target = Mutex<ExtendedSummary>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
