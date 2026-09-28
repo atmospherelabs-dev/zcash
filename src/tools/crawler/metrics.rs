@@ -6,7 +6,7 @@ use spectre::{edge::Edge, graph::Graph};
 use ziggurat_core_crawler::summary::{NetworkSummary, NetworkType};
 
 use crate::{
-    network::{KnownNode, LAST_SEEN_CUTOFF},
+    network::{unix_ms, KnownNode, LAST_SEEN_CUTOFF},
     Crawler,
 };
 
@@ -18,6 +18,7 @@ pub const ZCASH_P2P_DEFAULT_TESTNET_PORT: u16 = 18233;
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeInfo {
     pub addr: String,
+    pub last_verified_at_ms: Option<u64>,
     pub user_agent: Option<String>,
     pub protocol_version: Option<u32>,
     pub start_height: Option<i32>,
@@ -36,6 +37,7 @@ pub struct NodeInfo {
 pub struct ExtendedSummary {
     #[serde(flatten)]
     pub summary: NetworkSummary,
+    pub generated_at_ms: u64,
     pub node_info: Vec<NodeInfo>,
     /// All known node addresses (reachable + unreachable), stable order matching `all_nodes_indices`.
     pub all_node_addrs: Vec<String>,
@@ -75,6 +77,7 @@ impl NetworkMetrics {
                 let known = nodes.get(addr);
                 NodeInfo {
                     addr: addr.to_string(),
+                    last_verified_at_ms: known.and_then(|n| n.last_verified_at_ms),
                     user_agent: known.and_then(|n| n.user_agent.as_ref().map(|v| v.0.clone())),
                     protocol_version: known.and_then(|n| n.protocol_version.map(|v| v.0)),
                     start_height: known.and_then(|n| n.start_height),
@@ -93,12 +96,13 @@ impl NetworkMetrics {
         let all_nodes_indices = self.graph.get_filtered_adjacency_indices(&all_addrs);
         let all_node_reachable: Vec<bool> = all_addrs
             .iter()
-            .map(|a| nodes.get(a).and_then(|n| n.last_connected).is_some())
+            .map(|a| nodes.get(a).is_some_and(|n| n.recently_verified()))
             .collect();
         let all_node_addrs: Vec<String> = all_addrs.iter().map(|a| a.to_string()).collect();
 
         ExtendedSummary {
             summary,
+            generated_at_ms: unix_ms(),
             node_info,
             all_node_addrs,
             all_nodes_indices,
@@ -183,7 +187,7 @@ pub fn new_network_summary(
 
     let good_nodes = nodes
         .iter()
-        .filter_map(|(addr, node)| node.last_connected.map(|_| *addr))
+        .filter_map(|(addr, node)| node.recently_verified().then_some(*addr))
         .collect::<Vec<_>>();
 
     let num_good_nodes = good_nodes.len();

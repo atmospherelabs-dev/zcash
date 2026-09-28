@@ -18,7 +18,6 @@ use tokio::{signal, time::sleep};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use ziggurat_core_crawler::summary::NetworkSummary;
-use ziggurat_zcash::wait_until;
 
 use crate::{
     metrics::{NetworkMetrics, ZCASH_P2P_DEFAULT_MAINNET_PORT},
@@ -35,8 +34,6 @@ mod network;
 mod protocol;
 mod rpc;
 
-const SEED_WAIT_LOOP_INTERVAL_MS: u64 = 500;
-const SEED_RESPONSE_TIMEOUT_MS: u64 = 120_000;
 const SUMMARY_LOOP_INTERVAL: u64 = 60;
 const LOG_PATH: &str = "crawler-log.txt";
 
@@ -54,6 +51,10 @@ struct Args {
     /// If present, start an RPC server at the specified address
     #[clap(short, long, value_parser)]
     rpc_addr: Option<SocketAddr>,
+
+    /// Route outbound peer connections through SOCKS5; RPC stays direct and local.
+    #[clap(long)]
+    socks5_proxy: Option<SocketAddr>,
 
     /// Default port used for connecting to the nodes
     #[clap(short, long, value_parser, default_value_t = ZCASH_P2P_DEFAULT_MAINNET_PORT)]
@@ -144,11 +145,13 @@ async fn main() {
     let seed_addrs = parse_addrs(args.seed_addrs, args.node_listening_port);
 
     // Create the crawler with the given listener address.
-    let crawler = Crawler::new().await;
+    let mut crawler = Crawler::new().await;
+    crawler.socks5_proxy = args.socks5_proxy;
 
     let mut network_metrics = NetworkMetrics::default();
     let summary_snapshot = Arc::new(Mutex::new(ExtendedSummary {
         summary: NetworkSummary::default(),
+        generated_at_ms: 0,
         node_info: Vec::new(),
         all_node_addrs: Vec::new(),
         all_nodes_indices: Vec::new(),
@@ -169,38 +172,19 @@ async fn main() {
     crawler.enable_writing().await;
 
     for addr in &seed_addrs {
-        let crawler_clone = crawler.clone();
-        let addr = *addr;
-
-        tokio::spawn(async move {
-            crawler_clone
-                .known_network
-                .nodes
-                .write()
-                .insert(addr, KnownNode::default());
-
-            // Once the Version message is received in the process_message function,
-            // GetAddr will be requested from the peer
-            let _ = crawler_clone.connect(addr).await;
-        });
+        crawler
+            .known_network
+            .nodes
+            .write()
+            .insert(*addr, KnownNode::default());
     }
-
-    // Wait for a single successful connection before proceeding.
-    wait_until!(Duration::from_secs(3), crawler.node().num_connected() >= 1);
-
-    // Wait for one of the seed nodes to respond with a list of addrs.
-    wait_until!(
-        Duration::from_millis(SEED_RESPONSE_TIMEOUT_MS),
-        crawler.known_network.nodes().len() > seed_addrs.len(),
-        Duration::from_millis(SEED_WAIT_LOOP_INTERVAL_MS)
-    );
 
     let crawler_clone = crawler.clone();
     let crawling_loop_task = tokio::spawn(async move {
         let crawler = crawler_clone;
         loop {
             info!(parent: crawler.node().span(), "asking peers for their peers (connected to {})", crawler.node().num_connected());
-            info!(parent: crawler.node().span(), "known addrs: {}", crawler.known_network.num_nodes());
+            info!(parent: crawler.node().span(), "known addrs: {}, connecting: {}", crawler.known_network.num_nodes(), crawler.node().num_connecting());
 
             // Filter nodes that stuck in connected state for longer than 3 minutes
             for (addr, _) in crawler
@@ -226,12 +210,13 @@ async fn main() {
                     .set_node_state(addr, ConnectionState::Disconnected);
             }
 
+            let mut attempts = tokio::task::JoinSet::new();
             for (addr, _) in crawler
                 .known_network
                 .nodes()
                 .into_iter()
                 .filter(|(_, node)| {
-                    if let Some(i) = node.last_connected {
+                    if let Some(i) = node.last_attempt {
                         i.elapsed().as_secs() >= RECONNECT_INTERVAL_SECS
                     } else {
                         true
@@ -241,7 +226,7 @@ async fn main() {
             {
                 if crawler.should_connect(addr) {
                     let crawler_clone = crawler.clone();
-                    tokio::spawn(async move {
+                    attempts.spawn(async move {
                         // Once the Version message is received in the process_message function,
                         // GetAddr will be requested from the peer
                         let _ = crawler_clone.connect(addr).await;
@@ -249,6 +234,7 @@ async fn main() {
                 }
             }
 
+            while attempts.join_next().await.is_some() {}
             sleep(Duration::from_secs(args.crawl_interval)).await;
         }
     });
@@ -261,16 +247,11 @@ async fn main() {
         loop {
             let start_time = Instant::now();
 
-            if crawler.known_network.num_connections() > 0 {
-                crawler.known_network.remove_old_connections();
-
-                // Update graph, then create a summary and log it to a file.
-                network_metrics.update_graph(&crawler);
-                let new_summary = network_metrics.request_summary(&crawler);
-
-                // Aquire lock and replace old summary snapshot with the newly generated one.
-                *summary_snapshot.lock() = new_summary;
-            }
+            // Always publish a heartbeat, including an empty graph after expiry.
+            network_metrics.update_graph(&crawler);
+            crawler.known_network.remove_old_connections();
+            let new_summary = network_metrics.request_summary(&crawler);
+            *summary_snapshot.lock() = new_summary;
 
             let delta_time =
                 Duration::from_secs(SUMMARY_LOOP_INTERVAL).saturating_sub(start_time.elapsed());
@@ -314,7 +295,7 @@ mod tests {
             String::from("127.0.0.1"),
             String::from("192.0.2.235:54321"),
         ];
-        let parsed_addrs = parse_addrs(addrs);
+        let parsed_addrs = parse_addrs(addrs, ZCASH_P2P_DEFAULT_MAINNET_PORT);
 
         let correct_addrs = vec![
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 12345),

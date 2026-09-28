@@ -1,4 +1,9 @@
-use std::{io, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::time::timeout;
 
 use futures_util::SinkExt;
@@ -34,6 +39,7 @@ pub struct Crawler {
     node: Pea2PeaNode,
     pub known_network: Arc<KnownNetwork>,
     pub start_time: Instant,
+    pub socks5_proxy: Option<SocketAddr>,
 }
 
 impl Pea2Pea for Crawler {
@@ -56,6 +62,7 @@ impl Crawler {
             node: Pea2PeaNode::new(config),
             known_network: Default::default(),
             start_time: Instant::now(),
+            socks5_proxy: None,
         }
     }
 
@@ -65,14 +72,38 @@ impl Crawler {
 
         let timestamp = Instant::now();
 
+        if let Some(node) = self.known_network.nodes.write().get_mut(&addr) {
+            node.last_attempt = Some(timestamp);
+            node.version_received = false;
+            node.verack_received = false;
+        }
+        let connect = async {
+            if let Some(proxy) = self.socks5_proxy {
+                let stream = tokio_socks::tcp::Socks5Stream::connect(proxy, addr)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                self.node
+                    .connect_using_stream(addr, stream.into_inner())
+                    .await
+            } else {
+                self.node.connect(addr).await
+            }
+        };
         let result = match timeout(
-            Duration::from_secs(CONNECT_TIMEOUT_SECS),
-            self.node.connect(addr),
+            Duration::from_secs(if self.socks5_proxy.is_some() {
+                30
+            } else {
+                CONNECT_TIMEOUT_SECS
+            }),
+            connect,
         )
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out")),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TCP connect timed out",
+            )),
         };
 
         if let Some(ref mut known_node) = self.known_network.nodes.write().get_mut(&addr) {
@@ -80,12 +111,12 @@ impl Crawler {
                 Ok(_) => {
                     known_node.connection_failures = 0;
                     known_node.last_connected = Some(timestamp);
-                    known_node.handshake_time = Some(timestamp.elapsed());
                     known_node.state = ConnectionState::Connected;
                 }
                 Err(_) => {
                     trace!(parent: self.node().span(), "failed to connect to {}", addr);
-                    known_node.connection_failures += 1;
+                    known_node.connection_failures =
+                        known_node.connection_failures.saturating_add(1);
                 }
             }
         }
@@ -183,6 +214,12 @@ impl Reading for Crawler {
             Message::GetData(inv) => {
                 let _ = self.unicast(source, Message::NotFound(inv.clone()))?.await;
             }
+            Message::Verack => {
+                if let Some(node) = self.known_network.nodes.write().get_mut(&source) {
+                    node.verack_received = true;
+                    node.record_verification();
+                }
+            }
             Message::Version(ver) => {
                 // Update source node with information from version.
                 if let Some(known_node) = self.known_network.nodes.write().get_mut(&source) {
@@ -190,6 +227,8 @@ impl Reading for Crawler {
                     known_node.user_agent = Some(ver.user_agent);
                     known_node.services = Some(ver.services);
                     known_node.start_height = Some(ver.start_height);
+                    known_node.version_received = true;
+                    known_node.record_verification();
                 }
 
                 let _ = self.unicast(source, Message::Verack)?.await;
@@ -218,5 +257,120 @@ impl Writing for Crawler {
 
     fn codec(&self, _addr: SocketAddr, _side: ConnectionSide) -> Self::Codec {
         Default::default()
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+    use crate::metrics::NetworkMetrics;
+    use crate::network::KnownNode;
+    use tokio::net::TcpListener;
+
+    #[derive(Clone)]
+    struct SlowHandshake(Pea2PeaNode);
+    impl Pea2Pea for SlowHandshake {
+        fn node(&self) -> &Pea2PeaNode {
+            &self.0
+        }
+    }
+    #[async_trait::async_trait]
+    impl Handshake for SlowHandshake {
+        const TIMEOUT_MS: u64 = 60_000;
+        async fn perform_handshake(&self, conn: Connection) -> io::Result<Connection> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(conn)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_connect_releases_capacity_and_allows_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let node = SlowHandshake(Pea2PeaNode::new(Config {
+            listener_ip: None,
+            ..Default::default()
+        }));
+        node.enable_handshake().await;
+        for _ in 0..3 {
+            let (result, accepted) = tokio::join!(
+                timeout(Duration::from_millis(30), node.node().connect(addr)),
+                listener.accept()
+            );
+            assert!(result.is_err());
+            assert_eq!(node.node().num_connecting(), 0);
+            drop(accepted.unwrap());
+        }
+        node.node().shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_uses_destination_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        let node = Pea2PeaNode::new(Config {
+            listener_ip: None,
+            ..Default::default()
+        });
+        let destination = "192.0.2.1:8233".parse().unwrap();
+        node.connect_using_stream(destination, stream)
+            .await
+            .unwrap();
+        assert!(node.is_connected(destination));
+        assert_eq!(node.num_connecting(), 0);
+        node.shut_down().await;
+    }
+
+    #[tokio::test]
+    async fn empty_graph_summary_advances_and_only_recent_protocol_handshakes_count() {
+        let crawler = Crawler::new().await;
+        let good: SocketAddr = "192.0.2.1:8233".parse().unwrap();
+        let old: SocketAddr = "192.0.2.2:8233".parse().unwrap();
+        let tcp_only: SocketAddr = "192.0.2.3:8233".parse().unwrap();
+        let mut verified = KnownNode {
+            version_received: true,
+            verack_received: true,
+            ..Default::default()
+        };
+        verified.record_verification();
+        let old_node = KnownNode {
+            last_verified: Some(Instant::now() - Duration::from_secs(3601)),
+            ..Default::default()
+        };
+        let tcp_node = KnownNode {
+            last_connected: Some(Instant::now()),
+            ..Default::default()
+        };
+        crawler.known_network.nodes.write().extend([
+            (good, verified),
+            (old, old_node),
+            (tcp_only, tcp_node),
+        ]);
+        let mut metrics = NetworkMetrics::default();
+        let first = metrics.request_summary(&crawler);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = metrics.request_summary(&crawler);
+        assert!(second.generated_at_ms > first.generated_at_ms);
+        assert!(second.summary.crawler_runtime > first.summary.crawler_runtime);
+        assert_eq!(second.summary.num_good_nodes, 1);
+        assert_eq!(second.node_info[0].addr, good.to_string());
+        assert!(second.node_info[0].last_verified_at_ms.is_some());
+        assert_eq!(second.all_node_reachable.iter().filter(|v| **v).count(), 1);
+    }
+
+    #[test]
+    fn verification_requires_both_version_and_verack() {
+        let mut node = KnownNode {
+            version_received: true,
+            ..Default::default()
+        };
+        node.record_verification();
+        assert!(!node.recently_verified());
+        node.verack_received = true;
+        node.record_verification();
+        assert!(node.recently_verified());
     }
 }
